@@ -1,0 +1,20 @@
+# Virtual environment
+venv/
+
+# Environment variables (API keys — never commit this)
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Mac system files
+.DS_Store
+
+# Chroma vector store (generated, not source)
+app/data/chroma_db/
+
+# Logs
+*.log
