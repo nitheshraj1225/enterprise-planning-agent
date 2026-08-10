@@ -18,3 +18,4 @@ app/data/chroma_db/
 
 # Logs
 *.log
+CONTEXT.md
