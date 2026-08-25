@@ -16,9 +16,8 @@ There are two ways to get structured (JSON) output from Claude:
      mechanism Module 4 (Tool Use) is built on.
 
 This project deliberately starts with approach #1 here, matching what the
-"Building with the Claude API" course lesson taught, and will upgrade to
-approach #2 once the real tool-use loop is built in Module 4 — building the
-production version once, correctly, rather than twice.
+"Building with the Claude API" course lesson taught, and upgrades to
+approach #2 below — building the production version once, correctly.
 
 Cost control:
     Mock-first, same pattern as client.py and conversation.py. No network
@@ -26,17 +25,13 @@ Cost control:
 """
 
 import json
-
 from app.agent.client import get_client, USE_REAL_API, TEST_MODEL, TEST_MAX_TOKENS
 
-# The exact JSON shape we're asking Claude to return. Kept simple on
-# purpose for this lesson — the real Epic-sizing schema will grow once
-# this becomes the tool-forced version in Module 4.
+# The exact JSON shape we're asking Claude to return (approach #1).
 EPIC_SIZING_INSTRUCTIONS = """
 You are an enterprise planning assistant. Given a short description of an
 Epic, respond with ONLY a valid JSON object — no other text before or
 after it — matching exactly this shape:
-
 {
   "epic_id": "<string, the Epic identifier if mentioned, else null>",
   "size_estimate": <integer, story points from 1-13>,
@@ -45,20 +40,33 @@ after it — matching exactly this shape:
 }
 """
 
+# Tool schema for approach #2 — the tool-forced version.
+EPIC_SIZING_TOOL = {
+    "name": "record_epic_estimate",
+    "description": "Record a structured size estimate for an Epic.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "epic_id": {"type": "string"},
+            "size_estimate": {
+                "type": "integer",
+                "enum": [1, 2, 3, 5, 8, 13, 21]
+            },
+            "confidence": {"type": "number"},
+            "rationale": {"type": "string"},
+        },
+        "required": ["epic_id", "size_estimate", "confidence", "rationale"],
+    },
+}
+
 
 def get_structured_epic_estimate(epic_description: str, use_real: bool = USE_REAL_API) -> dict:
     """
-    Sends an Epic description to Claude with instructions to respond in a
-    fixed JSON shape, parses the response with json.loads(), and returns
-    a Python dict.
-
-    Returns a dict either way (mock or real), so calling code doesn't need
-    to know or care which one ran.
+    Approach #1: message-based structured output. Sends an Epic description
+    to Claude with instructions to respond in a fixed JSON shape, parses the
+    response with json.loads(), and returns a Python dict.
     """
     if not use_real:
-        # Mock response mimics the exact JSON shape a real call should
-        # produce, so downstream parsing code can be written and tested
-        # against it without spending any tokens.
         mock_json_text = json.dumps({
             "epic_id": "EPIC-142",
             "size_estimate": 8,
@@ -78,24 +86,48 @@ def get_structured_epic_estimate(epic_description: str, use_real: bool = USE_REA
         messages=[{"role": "user", "content": epic_description}],
     )
     raw_text = response.content[0].text
-
     # This is exactly the fragility approach #1 has that approach #2
     # (tool-forced schema) doesn't: we're trusting Claude followed
-    # instructions closely enough that json.loads() won't blow up. If
-    # Claude added any stray text around the JSON, this raises an error —
-    # a concrete, demonstrable reason to upgrade to tool-forced schemas
-    # once the real tool-use loop exists.
+    # instructions closely enough that json.loads() won't blow up.
     return json.loads(raw_text)
 
 
+def get_structured_epic_estimate_tool_forced(epic_description: str, use_real: bool = USE_REAL_API) -> dict:
+    """
+    Approach #2: tool-forced structured output (Module 4 upgrade). Forces
+    Claude to "call" a tool matching EPIC_SIZING_TOOL's schema — the API
+    itself enforces the shape, no json.loads() needed.
+    """
+    if not use_real:
+        return {
+            "epic_id": "EPIC-142",
+            "size_estimate": 8,
+            "confidence": 0.72,
+            "rationale": "[MOCK — no API call made] Based on similar historical Epics of comparable scope.",
+        }
+
+    client = get_client()
+    response = client.messages.create(
+        model=TEST_MODEL,
+        max_tokens=TEST_MAX_TOKENS,
+        tools=[EPIC_SIZING_TOOL],
+        tool_choice={"type": "tool", "name": "record_epic_estimate"},
+        messages=[{"role": "user", "content": epic_description}],
+    )
+    return response.content[0].input
+
+
 if __name__ == "__main__":
-    # Run this file directly to see structured-output mechanics without
-    # spending any tokens:
-    #   python -m app.agent.structured_output_demo
+    print("=== Message-based version (Module 1) ===")
     result = get_structured_epic_estimate(
         "Epic-142: migrate legacy reporting module to the new dashboard."
     )
-    print("Parsed structured result:")
     print(result)
-    print(f"\nType check — this is a real Python dict: {type(result)}")
-    print(f"Direct field access works: result['size_estimate'] = {result['size_estimate']}")
+
+    print("\n=== Tool-forced version (Module 4 upgrade) ===")
+    result_v2 = get_structured_epic_estimate_tool_forced(
+        "Epic-142: migrate legacy reporting module to the new dashboard."
+    )
+    print(result_v2)
+    print(f"\nType check: {type(result_v2)}")
+    print(f"Direct field access: result_v2['size_estimate'] = {result_v2['size_estimate']}")
