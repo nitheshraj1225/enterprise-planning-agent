@@ -18,6 +18,7 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))  # so "app.audit..." resolves when run directly
 import json
+FIBONACCI_SCALE = (1, 2, 3, 5, 8, 13, 21)
 from app.audit.logger import get_audit_log
 from mcp.server.fastmcp import FastMCP
 
@@ -138,6 +139,43 @@ def create_action_request(description: str, priority: str = "medium") -> dict:
         "source": "mock_action_request",
     }
 
+# ---------------------------------------------------------------------
+# Tool 5: prompt_request
+# ---------------------------------------------------------------------
+@mcp.prompt()
+def epic_sizing_prompt(epic_id: str) -> str:
+    """
+    Server-defined Epic-sizing prompt template, reusing Module 3's
+    XML-tag + chain-of-thought pattern. Looks up the real Epic file
+    from the synthetic corpus and returns a fully-populated prompt —
+    not a blank template — ready to send to Claude.
+    """
+    epic_path = os.path.join("app", "data", "synthetic_corpus", "epics", f"{epic_id}.md")
+
+    if not os.path.exists(epic_path):
+        return f"No Epic found with ID {epic_id}."
+
+    with open(epic_path, "r") as f:
+        epic_content = f.read()  # whole file content, same "reuse the paragraph" spirit as RAG chunking
+
+    return (
+        "<epic_context>\n"
+        f"{epic_content}"
+        "\n</epic_context>\n"
+        "<instructions>\n"
+        f"Estimate the size of this Epic using the Fibonacci scale {FIBONACCI_SCALE}. "
+        "Weigh two factors: (1) the overall scope of work described, and "
+        "(2) any cross-team dependencies mentioned.\n"
+        "</instructions>\n"
+        "<reasoning>\n"
+        "Before answering, work through: (1) which similar historical Epics "
+        "this resembles, (2) any cross-team dependencies mentioned, "
+        "(3) complexity signals from the scope of work described.\n"
+        "</reasoning>\n"
+        "<answer>\n"
+        "Output only the single number from the scale above — no explanation, no extra text.\n"
+        "</answer>"
+    )
 
 # ---------------------------------------------------------------------
 # Resource: audit log
