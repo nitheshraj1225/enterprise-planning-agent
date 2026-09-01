@@ -14,6 +14,11 @@ same function signature and same dict shape, so nothing downstream
 (the LLM's understanding of the tool, the client code) needs to change.
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))  # so "app.audit..." resolves when run directly
+import json
+from app.audit.logger import get_audit_log
 from mcp.server.fastmcp import FastMCP
 
 # FastMCP is the high-level MCP server class. Passing a name here is
@@ -132,6 +137,21 @@ def create_action_request(description: str, priority: str = "medium") -> dict:
         "status": "created",
         "source": "mock_action_request",
     }
+
+
+# ---------------------------------------------------------------------
+# Resource: audit log
+# ---------------------------------------------------------------------
+# Resources are read-only — a client fetches data at a fixed URI,
+# rather than calling a function with arguments like a tool. Content
+# must be a string/bytes, so entries get JSON-serialized here.
+@mcp.resource("audit://log")
+def audit_log_resource() -> str:
+    """
+    Read-only MCP resource exposing the SOX-conscious audit log.
+    """
+    entries = get_audit_log()  # everything logged so far, oldest first
+    return json.dumps(entries, indent=2)
 
 
 # ---------------------------------------------------------------------
