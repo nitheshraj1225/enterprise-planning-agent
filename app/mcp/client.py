@@ -2,18 +2,23 @@
 MCP Client for the Enterprise Planning Intelligence Agent.
 Author: Nithesh Bongoni
 
-Course topic: "Implementing a Client — Using ClientSession"
+Course topics: "Implementing a Client — Using ClientSession" +
+"Accessing Resources"
 
-server.py exposes tools; this file is the CLIENT that connects and uses
-them, replacing the Inspector (a generic test tool) with real code.
+server.py exposes tools and a resource; this file is the CLIENT that
+connects and uses them, replacing the Inspector (a generic test tool)
+with real code.
 
-Analogy: server.py is a kitchen that cooks dishes (tools) on request.
+Analogy: server.py is a kitchen that cooks dishes (tools) on request
+and keeps a readable logbook (the audit://log resource) on the counter.
 This file is the waiter — connects, reads the menu, places an order,
-brings back the result. Maps to Architecture's "FastAPI Agent Endpoint
-→ MCP Server" arrow, written by hand.
+brings back the result, and can also just walk over and read the
+logbook directly without "ordering" anything. Maps to Architecture's
+"FastAPI Agent Endpoint → MCP Server" arrow, written by hand.
 """
 
 import asyncio
+from pydantic import AnyUrl  # resource URIs are typed, not plain strings — see read_resource() below
 from mcp.client.stdio import stdio_client, StdioServerParameters  # launches the server subprocess, gives raw I/O streams
 from mcp.client.session import ClientSession  # speaks the actual MCP protocol over those streams
 
@@ -33,6 +38,15 @@ async def main():
             # Invocation — actually call one, with real arguments
             result = await session.call_tool("erp_record_fetch", {"record_id": "ERP-4821"})
             print("Result:", result)
+
+            # Discovery — what resources does the server offer?
+            resources_response = await session.list_resources()
+            print("Available resources:", [str(r.uri) for r in resources_response.resources])
+
+            # Access — read the audit log resource. AnyUrl() converts the
+            # plain string into the URI type read_resource() expects.
+            resource_result = await session.read_resource(AnyUrl("audit://log"))
+            print("Resource content:", resource_result.contents[0].text)
 
 
 if __name__ == "__main__":
