@@ -3,18 +3,19 @@ MCP Client for the Enterprise Planning Intelligence Agent.
 Author: Nithesh Bongoni
 
 Course topics: "Implementing a Client — Using ClientSession" +
-"Accessing Resources"
+"Accessing Resources" + "Prompts in the Client"
 
-server.py exposes tools and a resource; this file is the CLIENT that
-connects and uses them, replacing the Inspector (a generic test tool)
-with real code.
+server.py exposes tools, a resource, and a prompt template; this file
+is the CLIENT that connects and uses all three, replacing the Inspector
+(a generic test tool) with real code.
 
-Analogy: server.py is a kitchen that cooks dishes (tools) on request
-and keeps a readable logbook (the audit://log resource) on the counter.
-This file is the waiter — connects, reads the menu, places an order,
-brings back the result, and can also just walk over and read the
-logbook directly without "ordering" anything. Maps to Architecture's
-"FastAPI Agent Endpoint → MCP Server" arrow, written by hand.
+Analogy: server.py is a kitchen that cooks dishes (tools) on request,
+keeps a readable logbook (the audit://log resource), and has a printed
+recipe card (the epic_sizing_prompt template) it can hand you filled
+in for a specific dish. This file is the waiter — connects, reads the
+menu, places an order, reads the logbook, and asks for a recipe card.
+Maps to Architecture's "FastAPI Agent Endpoint → MCP Server" arrow,
+written by hand.
 """
 
 import asyncio
@@ -47,6 +48,14 @@ async def main():
             # plain string into the URI type read_resource() expects.
             resource_result = await session.read_resource(AnyUrl("audit://log"))
             print("Resource content:", resource_result.contents[0].text)
+
+            # Discovery — what prompt templates does the server offer?
+            prompts_response = await session.list_prompts()
+            print("Available prompts:", [p.name for p in prompts_response.prompts])
+
+            # Fetch — get the template filled in for a real Epic
+            prompt_result = await session.get_prompt("epic_sizing_prompt", {"epic_id": "EPIC-0001"})
+            print("Prompt content:", prompt_result.messages[0].content.text)
 
 
 if __name__ == "__main__":
