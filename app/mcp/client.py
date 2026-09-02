@@ -19,17 +19,47 @@ written by hand.
 """
 
 import asyncio
+import mcp.types as types
+from app.agent.client import get_client, TEST_MODEL
 from pydantic import AnyUrl  # resource URIs are typed, not plain strings — see read_resource() below
 from mcp.client.stdio import stdio_client, StdioServerParameters  # launches the server subprocess, gives raw I/O streams
 from mcp.client.session import ClientSession  # speaks the actual MCP protocol over those streams
 
+async def handle_sampling_message(context, params):
+    """
+    Real Sampling handler — the CLIENT side of MCP Sampling. When the
+    server sends a sampling/createMessage request (e.g. jira_epic_lookup
+    asking for a clarifying question on a thin Epic description), this
+    is what actually calls Claude, replacing the Inspector's stub-model
+    echo from earlier testing with a genuine answer.
+
+    Workflow: pull the server's prompt text out of params.messages ->
+    call Claude via the same get_client()/TEST_MODEL this project
+    already uses everywhere else -> wrap Claude's answer back into the
+    CreateMessageResult shape the MCP protocol expects -> return it.
+    """
+    prompt_text = params.messages[-1].content.text  # the server's actual ask
+
+    client = get_client()
+    response = client.messages.create(
+        model=TEST_MODEL,
+        max_tokens=params.maxTokens,
+        messages=[{"role": "user", "content": prompt_text}],
+    )
+
+    return types.CreateMessageResult(
+        role="assistant",
+        content=types.TextContent(type="text", text=response.content[0].text),
+        model=TEST_MODEL,
+        stopReason="endTurn",
+    )
 
 async def main():
     # Same command as running the server manually — client launches it as a subprocess
     server_params = StdioServerParameters(command="python", args=["app/mcp/server.py"])
 
     async with stdio_client(server_params) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
+        async with ClientSession(read_stream, write_stream, sampling_callback=handle_sampling_message) as session:
             await session.initialize()  # protocol handshake, required before any real calls
 
             # Discovery — what tools does the server offer?
@@ -56,6 +86,12 @@ async def main():
             # Fetch — get the template filled in for a real Epic
             prompt_result = await session.get_prompt("epic_sizing_prompt", {"epic_id": "EPIC-0001"})
             print("Prompt content:", prompt_result.messages[0].content.text)
+
+            # Sampling — call the tool on a thin-description Epic and let
+            # our real handle_sampling_message() answer the server's
+            # clarifying-question request, instead of the Inspector's stub.
+            epic_result = await session.call_tool("jira_epic_lookup", {"epic_key": "EPA-6"})
+            print("Epic lookup (with real Sampling):", epic_result)
 
 
 if __name__ == "__main__":

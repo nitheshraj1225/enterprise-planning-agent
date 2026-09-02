@@ -21,6 +21,7 @@ import json
 import requests
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP, Context
+import mcp.types as types
 
 load_dotenv()
 
@@ -171,30 +172,67 @@ def _extract_description_text(description_adf):
 
 
 @mcp.tool()
-def jira_epic_lookup(epic_key: str) -> dict:
+async def jira_epic_lookup(epic_key: str, ctx: Context) -> dict:
     """
     Fetch a real Epic's details from Jira Cloud.
+
+    Workflow: fetch the Epic from Jira -> extract its plain-text
+    description -> if the description is too thin to size confidently,
+    ask the client's own LLM (via MCP Sampling) to draft one specific
+    clarifying question -> return the Epic details, with a
+    clarifying_question field attached only when one was actually needed.
 
     Args:
         epic_key: The Epic's Jira key, e.g. "EPA-6".
 
     Returns:
-        A dict with the Epic's title, status, and description — same
-        structured-dict shape as erp_record_fetch, backed by a live
-        Jira API call instead of mock data.
+        A dict with the Epic's title, status, description, and — when the
+        description was too thin to size on — a clarifying_question the
+        client's LLM drafted.
     """
     resp = requests.get(f"{JIRA_BASE_URL}/rest/api/3/issue/{epic_key}", auth=JIRA_AUTH, headers=JIRA_HEADERS)
     if resp.status_code == 404:
         return {"error": f"Epic {epic_key} not found", "epic_key": epic_key}
     resp.raise_for_status()
     fields = resp.json()["fields"]
-    return {
+    description = _extract_description_text(fields.get("description"))
+
+    result = {
         "epic_key": epic_key,
         "title": fields["summary"],
         "status": fields["status"]["name"],
-        "description": _extract_description_text(fields.get("description")),
+        "description": description,
         "source": "real_jira",
     }
+
+    # Sampling: a description under 40 chars isn't enough for
+    # epic_sizing_prompt to work from — rather than the server silently
+    # sizing on nothing, ask the CLIENT's LLM to draft a clarifying
+    # question. Server-initiated inference, the inverse of every other
+    # tool call in this project (client normally asks server to do work).
+    THIN_DESCRIPTION_CHARS = 40
+    if len(description.strip()) < THIN_DESCRIPTION_CHARS:
+        sampling_result = await ctx.request_context.session.create_message(
+            messages=[
+                types.SamplingMessage(
+                    role="user",
+                    content=types.TextContent(
+                        type="text",
+                        text=(
+                            f"The Jira Epic '{fields['summary']}' ({epic_key}) has "
+                            f"little to no description (currently: \"{description}\"). "
+                            "Draft one specific clarifying question a delivery lead "
+                            "should ask the Epic's owner before this can be sized "
+                            "confidently for annual planning."
+                        ),
+                    ),
+                )
+            ],
+            max_tokens=100,
+        )
+        result["clarifying_question"] = sampling_result.content.text
+
+    return result
 
 
 # ---------------------------------------------------------------------
