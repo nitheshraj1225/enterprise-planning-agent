@@ -19,6 +19,7 @@ written by hand.
 """
 
 import asyncio
+from pathlib import Path
 import mcp.types as types
 from app.agent.client import get_client, TEST_MODEL
 from pydantic import AnyUrl  # resource URIs are typed, not plain strings — see read_resource() below
@@ -54,12 +55,30 @@ async def handle_sampling_message(context, params):
         stopReason="endTurn",
     )
 
+async def handle_list_roots(context):
+    """
+    Real Roots handler — the CLIENT side of MCP Roots. Declares the one
+    directory this client is willing to let the server read Epic files
+    from, enforced server-side in epic_sizing_prompt before any file is
+    opened.
+
+    Workflow: find the project root relative to this file -> point at
+    the one directory that should be in-bounds (the synthetic corpus)
+    -> return it as a declared Root.
+    """
+    project_root = Path(__file__).resolve().parents[2]  # app/mcp/client.py -> project root
+    corpus_dir = project_root / "app" / "data" / "synthetic_corpus"
+    return types.ListRootsResult(
+        roots=[types.Root(uri=f"file://{corpus_dir}", name="Synthetic Corpus")]
+    )
+
+
 async def main():
     # Same command as running the server manually — client launches it as a subprocess
     server_params = StdioServerParameters(command="python", args=["app/mcp/server.py"])
 
     async with stdio_client(server_params) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream, sampling_callback=handle_sampling_message) as session:
+        async with ClientSession(read_stream, write_stream, sampling_callback=handle_sampling_message, list_roots_callback=handle_list_roots) as session:
             await session.initialize()  # protocol handshake, required before any real calls
 
             # Discovery — what tools does the server offer?
@@ -86,6 +105,13 @@ async def main():
             # Fetch — get the template filled in for a real Epic
             prompt_result = await session.get_prompt("epic_sizing_prompt", {"epic_id": "EPIC-0001"})
             print("Prompt content:", prompt_result.messages[0].content.text)
+
+            # Roots — the prompt call above (EPIC-0001) already proves the
+            # normal case still works now that Roots checking is wired in.
+            # This proves the boundary is actually enforced, not just
+            # declared: a path-traversal epic_id should be refused, not read.
+            blocked_result = await session.get_prompt("epic_sizing_prompt", {"epic_id": "../../../etc/passwd"})
+            print("Roots boundary test (should be refused):", blocked_result.messages[0].content.text)
 
             # Sampling — call the tool on a thin-description Epic and let
             # our real handle_sampling_message() answer the server's

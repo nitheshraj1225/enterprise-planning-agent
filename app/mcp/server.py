@@ -16,6 +16,7 @@ email/API-token auth pattern already used in scripts/seed_jira_data.py.
 
 import sys
 import os
+from pathlib import Path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))  # so "app.audit..." resolves when run directly
 import json
 import requests
@@ -323,16 +324,32 @@ async def jira_velocity_fetch(board_id: int, ctx: Context, num_sprints: int = 3)
 # Prompt: Epic-sizing template
 # ---------------------------------------------------------------------
 @mcp.prompt()
-def epic_sizing_prompt(epic_id: str) -> str:
+async def epic_sizing_prompt(epic_id: str, ctx: Context) -> str:
     """
     Server-defined Epic-sizing prompt template, reusing Module 3's
     XML-tag + chain-of-thought pattern. Looks up the real Epic file
     from the synthetic corpus and returns a fully-populated prompt —
     not a blank template — ready to send to Claude.
-    """
-    epic_path = os.path.join("app", "data", "synthetic_corpus", "epics", f"{epic_id}.md")
 
-    if not os.path.exists(epic_path):
+    Workflow: ask the client which directories the server is allowed
+    to read from (MCP Roots) -> resolve the requested Epic file's real
+    path -> refuse if it falls outside every declared root -> otherwise
+    read the file and return the populated sizing prompt.
+    """
+    # Roots — the client declares which directories are in-bounds;
+    # epic_id feeds directly into a file path, so without this check a
+    # crafted epic_id (e.g. "../../../etc/passwd") could read files
+    # well outside the corpus directory. Checked BEFORE existence, so a
+    # traversal attempt is refused regardless of whether the target
+    # exists — no reason to leak that information either way.
+    roots_result = await ctx.request_context.session.list_roots()
+    allowed_roots = [Path(root.uri.path).resolve() for root in roots_result.roots]
+
+    epic_path = Path("app", "data", "synthetic_corpus", "epics", f"{epic_id}.md").resolve()
+    if not any(epic_path.is_relative_to(root) for root in allowed_roots):
+        return f"Access denied: '{epic_id}' resolves outside the client's declared Roots."
+
+    if not epic_path.exists():
         return f"No Epic found with ID {epic_id}."
 
     with open(epic_path, "r") as f:
