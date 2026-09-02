@@ -1,23 +1,28 @@
 """
 MCP Server for the Enterprise Planning Intelligence Agent.
 
-This exposes 4 tools over the Model Context Protocol (MCP) using local
-stdio transport. Any MCP-compatible client (Claude Desktop, Claude Code,
-the MCP Inspector, or a custom script) can discover and call these tools
-without needing project-specific tool-calling code like Module 4's
-hand-rolled tool_choice loop.
+This exposes tools, a resource, and a prompt over the Model Context
+Protocol (MCP) using local stdio transport. Any MCP-compatible client
+(Claude Desktop, Claude Code, the MCP Inspector, or a custom script)
+can discover and call these without needing project-specific
+tool-calling code like Module 4's hand-rolled tool_choice loop.
 
-All 4 tools are MOCKED this week (Wednesday) — they return realistic,
-hardcoded structured data. Thursday swaps erp_record_fetch and
-finance_policy_retrieve's bodies for real Jira API calls, keeping the
-same function signature and same dict shape, so nothing downstream
-(the LLM's understanding of the tool, the client code) needs to change.
+erp_record_fetch, finance_policy_retrieve, check_recent_updates, and
+create_action_request stay MOCKED — they return realistic, hardcoded
+structured data. jira_epic_lookup and jira_velocity_fetch are REAL —
+they call Jira Cloud's REST/Agile APIs directly, using the same
+email/API-token auth pattern already used in scripts/seed_jira_data.py.
 """
 
 import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))  # so "app.audit..." resolves when run directly
 import json
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
 FIBONACCI_SCALE = (1, 2, 3, 5, 8, 13, 21)
 from app.audit.logger import get_audit_log
 from mcp.server.fastmcp import FastMCP
@@ -27,14 +32,18 @@ from mcp.server.fastmcp import FastMCP
 # Inspector UI, for example) — it's not used for routing.
 mcp = FastMCP("enterprise-planning-agent")
 
+# --- Real Jira integration (MCP Advanced) -----------------------------
+# Same email/token auth pattern already used in scripts/seed_jira_data.py.
+JIRA_BASE_URL = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
+JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
+JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
+JIRA_AUTH = (JIRA_EMAIL, JIRA_API_TOKEN)
+JIRA_HEADERS = {"Accept": "application/json"}
+
 
 # ---------------------------------------------------------------------
 # Tool 1: erp_record_fetch
 # ---------------------------------------------------------------------
-# @mcp.tool() reads this function's type hints and docstring to
-# auto-generate the JSON Schema a client needs to call it correctly.
-# Compare this to Module 4, where we hand-wrote input_schema dicts —
-# FastMCP generates that schema for us from ordinary Python.
 @mcp.tool()
 def erp_record_fetch(record_id: str) -> dict:
     """
@@ -48,8 +57,6 @@ def erp_record_fetch(record_id: str) -> dict:
         A dict with the record's status, owner, and last-updated date.
     """
     # MOCK: hardcoded response standing in for a real ERP system call.
-    # Thursday-equivalent tools (Jira) will replace this body with an
-    # actual HTTP request, but keep this same dict shape.
     return {
         "record_id": record_id,
         "status": "Active",
@@ -139,8 +146,122 @@ def create_action_request(description: str, priority: str = "medium") -> dict:
         "source": "mock_action_request",
     }
 
+
 # ---------------------------------------------------------------------
-# Tool 5: prompt_request
+# Tool 5: jira_epic_lookup (REAL — MCP Advanced Topics)
+# ---------------------------------------------------------------------
+def _extract_description_text(description_adf):
+    # Jira stores rich-text fields (like description) as ADF — a nested
+    # JSON document format, not plain text. This walks it and joins the
+    # plain text runs together, so callers get a normal string back.
+    if not description_adf:
+        return ""
+    parts = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("type") == "text":
+                parts.append(node.get("text", ""))
+            for child in node.get("content", []):
+                walk(child)
+
+    walk(description_adf)
+    return " ".join(parts)
+
+
+@mcp.tool()
+def jira_epic_lookup(epic_key: str) -> dict:
+    """
+    Fetch a real Epic's details from Jira Cloud.
+
+    Args:
+        epic_key: The Epic's Jira key, e.g. "EPA-6".
+
+    Returns:
+        A dict with the Epic's title, status, and description — same
+        structured-dict shape as erp_record_fetch, backed by a live
+        Jira API call instead of mock data.
+    """
+    resp = requests.get(f"{JIRA_BASE_URL}/rest/api/3/issue/{epic_key}", auth=JIRA_AUTH, headers=JIRA_HEADERS)
+    if resp.status_code == 404:
+        return {"error": f"Epic {epic_key} not found", "epic_key": epic_key}
+    resp.raise_for_status()
+    fields = resp.json()["fields"]
+    return {
+        "epic_key": epic_key,
+        "title": fields["summary"],
+        "status": fields["status"]["name"],
+        "description": _extract_description_text(fields.get("description")),
+        "source": "real_jira",
+    }
+
+
+# ---------------------------------------------------------------------
+# Tool 6: jira_velocity_fetch (REAL — MCP Advanced Topics)
+# ---------------------------------------------------------------------
+def _get_story_points_field_id():
+    # Per-site custom field ID, same lookup as the seed script — not
+    # hardcoded, since it can differ across Jira sites.
+    resp = requests.get(f"{JIRA_BASE_URL}/rest/api/3/field", auth=JIRA_AUTH, headers=JIRA_HEADERS)
+    resp.raise_for_status()
+    for f in resp.json():
+        if f["name"].lower() in ("story point estimate", "story points"):
+            return f["id"]
+    return None
+
+
+@mcp.tool()
+def jira_velocity_fetch(board_id: int, num_sprints: int = 3) -> dict:
+    """
+    Compute a team's real historical velocity from the last N CLOSED
+    sprints on a board — completed story points per sprint. This is the
+    grounding evidence an Epic-sizing estimate needs: how much has this
+    team actually delivered, not a guess.
+
+    Args:
+        board_id: The Jira Software board ID, e.g. 2.
+        num_sprints: How many of the most recent closed sprints to
+            analyze. Defaults to 3.
+
+    Returns:
+        A dict with per-sprint completed points and the average velocity.
+    """
+    points_field = _get_story_points_field_id()
+
+    sprints_resp = requests.get(
+        f"{JIRA_BASE_URL}/rest/agile/1.0/board/{board_id}/sprint?state=closed",
+        auth=JIRA_AUTH, headers=JIRA_HEADERS,
+    )
+    sprints_resp.raise_for_status()
+    closed_sprints = sprints_resp.json()["values"][-num_sprints:]
+
+    sprint_results = []
+    for sprint in closed_sprints:
+        # NOTE: the classic GET /rest/api/3/search endpoint was retired
+        # by Atlassian (410 Gone) — replaced by POST /rest/api/3/search/jql,
+        # which takes fields as a list and a JSON body instead of query params.
+        jql = f"sprint = {sprint['id']} AND statusCategory = Done"
+        search_resp = requests.post(
+            f"{JIRA_BASE_URL}/rest/api/3/search/jql",
+            auth=JIRA_AUTH, headers={**JIRA_HEADERS, "Content-Type": "application/json"},
+            json={"jql": jql, "fields": [points_field]},
+        )
+        search_resp.raise_for_status()
+        issues = search_resp.json()["issues"]
+        completed_points = sum(i["fields"].get(points_field) or 0 for i in issues)
+        sprint_results.append({"sprint_name": sprint["name"], "completed_points": completed_points})
+
+    avg_velocity = sum(s["completed_points"] for s in sprint_results) / len(sprint_results) if sprint_results else 0
+    return {
+        "board_id": board_id,
+        "sprints_analyzed": sprint_results,
+        "average_velocity": avg_velocity,
+        "source": "real_jira",
+    }
+
+
+# ---------------------------------------------------------------------
+# Prompt: Epic-sizing template
 # ---------------------------------------------------------------------
 @mcp.prompt()
 def epic_sizing_prompt(epic_id: str) -> str:
@@ -177,12 +298,10 @@ def epic_sizing_prompt(epic_id: str) -> str:
         "</answer>"
     )
 
+
 # ---------------------------------------------------------------------
 # Resource: audit log
 # ---------------------------------------------------------------------
-# Resources are read-only — a client fetches data at a fixed URI,
-# rather than calling a function with arguments like a tool. Content
-# must be a string/bytes, so entries get JSON-serialized here.
 @mcp.resource("audit://log")
 def audit_log_resource() -> str:
     """
@@ -195,8 +314,5 @@ def audit_log_resource() -> str:
 # ---------------------------------------------------------------------
 # Entry point: run the server over stdio transport.
 # ---------------------------------------------------------------------
-# stdio is our documented Architecture decision for this phase — the
-# server reads/writes MCP messages over stdin/stdout. Remote transports
-# (HTTP/SSE + OAuth 2.1/PKCE) are explicitly deferred to Phase 2.
 if __name__ == "__main__":
     mcp.run()
