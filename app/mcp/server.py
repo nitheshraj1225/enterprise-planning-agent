@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 import json
 import requests
 from dotenv import load_dotenv
+from mcp.server.fastmcp import FastMCP, Context
 
 load_dotenv()
 
@@ -211,12 +212,17 @@ def _get_story_points_field_id():
 
 
 @mcp.tool()
-def jira_velocity_fetch(board_id: int, num_sprints: int = 3) -> dict:
+async def jira_velocity_fetch(board_id: int, ctx: Context, num_sprints: int = 3) -> dict:
     """
     Compute a team's real historical velocity from the last N CLOSED
     sprints on a board — completed story points per sprint. This is the
     grounding evidence an Epic-sizing estimate needs: how much has this
     team actually delivered, not a guess.
+
+    Workflow: fetch closed sprints from the board -> for each sprint,
+    report progress to the client -> JQL-query that sprint's Done issues
+    -> sum story points -> log the sprint's result -> after the loop,
+    average all sprints' points -> return the final dict.
 
     Args:
         board_id: The Jira Software board ID, e.g. 2.
@@ -234,9 +240,20 @@ def jira_velocity_fetch(board_id: int, num_sprints: int = 3) -> dict:
     )
     sprints_resp.raise_for_status()
     closed_sprints = sprints_resp.json()["values"][-num_sprints:]
+    total_sprints = len(closed_sprints)
 
     sprint_results = []
-    for sprint in closed_sprints:
+    for i, sprint in enumerate(closed_sprints, start=1):
+        # Progress notification — sent to the client BEFORE this sprint's
+        # API call, so a slow call still shows the client what's running.
+        await ctx.report_progress(
+            progress=i, total=total_sprints,
+            message=f"Analyzing {sprint['name']} ({i}/{total_sprints})...",
+        )
+
+        # Server-side JQL filtering — let Jira narrow to "done in this
+        # sprint" instead of pulling every issue and filtering in Python,
+        # same principle as retrieve()'s conditional `where` clause.
         # NOTE: the classic GET /rest/api/3/search endpoint was retired
         # by Atlassian (410 Gone) — replaced by POST /rest/api/3/search/jql,
         # which takes fields as a list and a JSON body instead of query params.
@@ -248,8 +265,12 @@ def jira_velocity_fetch(board_id: int, num_sprints: int = 3) -> dict:
         )
         search_resp.raise_for_status()
         issues = search_resp.json()["issues"]
-        completed_points = sum(i["fields"].get(points_field) or 0 for i in issues)
+        completed_points = sum(issue["fields"].get(points_field) or 0 for issue in issues)
         sprint_results.append({"sprint_name": sprint["name"], "completed_points": completed_points})
+
+        # Info log — a second, human-readable notification channel
+        # distinct from progress (percent-complete vs. a log line).
+        await ctx.info(f"{sprint['name']}: {completed_points} points completed")
 
     avg_velocity = sum(s["completed_points"] for s in sprint_results) / len(sprint_results) if sprint_results else 0
     return {
