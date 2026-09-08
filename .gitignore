@@ -15,7 +15,9 @@ __pycache__/
 
 # Chroma vector store (generated, not source)
 app/data/chroma_db/
+app/rag/chroma_db/
 
 # Logs
 *.log
 CONTEXT.md
+notebooks/
