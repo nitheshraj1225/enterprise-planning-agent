@@ -135,6 +135,52 @@ def test_description_above_40_chars_does_not_trigger_sampling(mock_get):
     assert "clarifying_question" not in result
 
 
+class _FailingSession:
+    """Session whose create_message() always raises — stands in for a
+    client that doesn't support the (optional) MCP Sampling capability,
+    or any other sampling failure."""
+
+    async def create_message(self, messages, max_tokens):
+        raise RuntimeError("client does not support sampling")
+
+
+class _NonTextSession:
+    """Session that returns a spec-legal but non-text sampling result."""
+
+    async def create_message(self, messages, max_tokens):
+        return types.CreateMessageResult(
+            role="assistant",
+            content=types.ImageContent(type="image", data="ZmFrZQ==", mimeType="image/png"),
+            model="fake-model",
+        )
+
+
+@patch("app.mcp.server.requests.get")
+def test_sampling_failure_degrades_gracefully_without_clarifying_question(mock_get):
+    # Thin description would normally trigger sampling, but the session's
+    # create_message() raises — the whole lookup must still succeed.
+    mock_get.return_value = _fake_jira_response("Epic with no description", "To Do", None)
+    ctx = _FakeContext(_FailingSession())
+
+    result = _run(jira_epic_lookup(epic_key="EPA-6", ctx=ctx))
+
+    assert result["epic_key"] == "EPA-6"
+    assert "clarifying_question" not in result
+
+
+@patch("app.mcp.server.requests.get")
+def test_non_text_sampling_content_degrades_gracefully(mock_get):
+    # Sampling succeeds, but the client returned ImageContent instead of
+    # TextContent — accessing .text directly would raise AttributeError.
+    mock_get.return_value = _fake_jira_response("Epic with no description", "To Do", None)
+    ctx = _FakeContext(_NonTextSession())
+
+    result = _run(jira_epic_lookup(epic_key="EPA-7", ctx=ctx))
+
+    assert result["epic_key"] == "EPA-7"
+    assert "clarifying_question" not in result
+
+
 @patch("app.mcp.server.requests.get")
 def test_whitespace_padding_is_stripped_before_length_check(mock_get):
     # Raw length is 42 (>= 40), but the stripped length is only 2 — proves

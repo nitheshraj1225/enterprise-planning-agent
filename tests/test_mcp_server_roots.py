@@ -44,6 +44,45 @@ class _FakeContext:
         self.request_context = _FakeRequestContext(root_paths)
 
 
+class _NoneUri:
+    """A URI whose .path is None — real Root/FileUrl objects always
+    resolve a path (even a bare 'file://' resolves to '/'), so this
+    duck-types the shape epic_sizing_prompt actually reads instead of
+    going through pydantic's FileUrl validation."""
+
+    path = None
+
+
+class _RootWithNonePath:
+    uri = _NoneUri()
+
+
+class _FakeRootsResult:
+    def __init__(self, roots):
+        self.roots = roots
+
+
+class _FakeSessionWithNonePathRoot:
+    """Session whose list_roots() includes one Root with no filesystem
+    path alongside a normal, valid one — proves the None path is skipped
+    rather than crashing the whole call."""
+
+    def __init__(self, valid_root_path):
+        self._valid_root_path = valid_root_path
+
+    async def list_roots(self):
+        return _FakeRootsResult(roots=[
+            _RootWithNonePath(),
+            Root(uri=FileUrl(f"file://{self._valid_root_path}")),
+        ])
+
+
+class _FakeContextWithNonePathRoot:
+    def __init__(self, valid_root_path):
+        session = _FakeSessionWithNonePathRoot(valid_root_path)
+        self.request_context = type("RC", (), {"session": session})()
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -97,3 +136,15 @@ def test_allowed_root_but_missing_epic_falls_through_to_not_found():
     result = _run(epic_sizing_prompt(epic_id="EPIC-9999-DOES-NOT-EXIST", ctx=ctx))
 
     assert result == "No Epic found with ID EPIC-9999-DOES-NOT-EXIST."
+
+
+def test_root_with_none_path_is_skipped_not_crashed():
+    # One declared Root has no filesystem path (uri.path is None) — it
+    # must be skipped rather than raising TypeError from Path(None), and
+    # the other, valid declared root should still work normally.
+    ctx = _FakeContextWithNonePathRoot(valid_root_path=str(PROJECT_ROOT))
+
+    result = _run(epic_sizing_prompt(epic_id="EPIC-0001", ctx=ctx))
+
+    assert not result.startswith("Access denied:")
+    assert "<epic_context>" in result

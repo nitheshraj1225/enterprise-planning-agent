@@ -28,7 +28,6 @@ load_dotenv()
 
 FIBONACCI_SCALE = (1, 2, 3, 5, 8, 13, 21)
 from app.audit.logger import get_audit_log
-from mcp.server.fastmcp import FastMCP
 
 # FastMCP is the high-level MCP server class. Passing a name here is
 # just an identifier the server reports to clients (shown in the
@@ -197,11 +196,13 @@ async def jira_epic_lookup(epic_key: str, ctx: Context) -> dict:
             f"{JIRA_BASE_URL}/rest/api/3/issue/{epic_key}",
             auth=JIRA_AUTH, headers=JIRA_HEADERS, timeout=JIRA_TIMEOUT_SECONDS,
         )
+        if resp.status_code == 404:
+            return {"error": f"Epic {epic_key} not found", "epic_key": epic_key}
+        resp.raise_for_status()
     except requests.exceptions.Timeout:
         return {"error": f"Jira request timed out while fetching Epic {epic_key}", "epic_key": epic_key}
-    if resp.status_code == 404:
-        return {"error": f"Epic {epic_key} not found", "epic_key": epic_key}
-    resp.raise_for_status()
+    except requests.exceptions.HTTPError as exc:
+        return {"error": f"Jira API error while fetching Epic {epic_key}: {exc}", "epic_key": epic_key}
     fields = resp.json()["fields"]
     description = _extract_description_text(fields.get("description"))
 
@@ -220,25 +221,34 @@ async def jira_epic_lookup(epic_key: str, ctx: Context) -> dict:
     # tool call in this project (client normally asks server to do work).
     THIN_DESCRIPTION_CHARS = 40
     if len(description.strip()) < THIN_DESCRIPTION_CHARS:
-        sampling_result = await ctx.request_context.session.create_message(
-            messages=[
-                types.SamplingMessage(
-                    role="user",
-                    content=types.TextContent(
-                        type="text",
-                        text=(
-                            f"The Jira Epic '{fields['summary']}' ({epic_key}) has "
-                            f"little to no description (currently: \"{description}\"). "
-                            "Draft one specific clarifying question a delivery lead "
-                            "should ask the Epic's owner before this can be sized "
-                            "confidently for annual planning."
+        try:
+            sampling_result = await ctx.request_context.session.create_message(
+                messages=[
+                    types.SamplingMessage(
+                        role="user",
+                        content=types.TextContent(
+                            type="text",
+                            text=(
+                                f"The Jira Epic '{fields['summary']}' ({epic_key}) has "
+                                f"little to no description (currently: \"{description}\"). "
+                                "Draft one specific clarifying question a delivery lead "
+                                "should ask the Epic's owner before this can be sized "
+                                "confidently for annual planning."
+                            ),
                         ),
-                    ),
-                )
-            ],
-            max_tokens=100,
-        )
-        result["clarifying_question"] = sampling_result.content.text
+                    )
+                ],
+                max_tokens=100,
+            )
+        except Exception:
+            # Sampling is an OPTIONAL MCP client capability — a client that
+            # doesn't support it, or any other sampling failure, should
+            # degrade to "no clarifying question" rather than crashing the
+            # whole Epic lookup over a nice-to-have.
+            sampling_result = None
+
+        if sampling_result is not None and isinstance(sampling_result.content, types.TextContent):
+            result["clarifying_question"] = sampling_result.content.text
 
     return result
 
@@ -299,7 +309,10 @@ async def jira_velocity_fetch(board_id: int, ctx: Context, num_sprints: int = 3)
             auth=JIRA_AUTH, headers=JIRA_HEADERS, timeout=JIRA_TIMEOUT_SECONDS,
         )
         sprints_resp.raise_for_status()
-        closed_sprints = sprints_resp.json()["values"][-num_sprints:]
+        # num_sprints=0 must mean zero sprints, not "no limit" — a plain
+        # [-0:] slice is equivalent to [0:] in Python since -0 == 0, which
+        # would silently return every closed sprint on the board instead.
+        closed_sprints = sprints_resp.json()["values"][-num_sprints:] if num_sprints > 0 else []
         total_sprints = len(closed_sprints)
 
         sprint_results = []
@@ -346,6 +359,12 @@ async def jira_velocity_fetch(board_id: int, ctx: Context, num_sprints: int = 3)
             "board_id": board_id,
             "source": "real_jira",
         }
+    except requests.exceptions.HTTPError as exc:
+        return {
+            "error": f"Jira API error while fetching velocity data for board {board_id}: {exc}",
+            "board_id": board_id,
+            "source": "real_jira",
+        }
 
 
 # ---------------------------------------------------------------------
@@ -371,7 +390,13 @@ async def epic_sizing_prompt(epic_id: str, ctx: Context) -> str:
     # traversal attempt is refused regardless of whether the target
     # exists — no reason to leak that information either way.
     roots_result = await ctx.request_context.session.list_roots()
-    allowed_roots = [Path(root.uri.path).resolve() for root in roots_result.roots]
+    # A declared Root's URI can legally have no filesystem path (e.g. a
+    # non-file:// scheme) — skip those rather than crashing on Path(None).
+    allowed_roots = [
+        Path(root.uri.path).resolve()
+        for root in roots_result.roots
+        if root.uri.path is not None
+    ]
 
     epic_path = Path("app", "data", "synthetic_corpus", "epics", f"{epic_id}.md").resolve()
     if not any(epic_path.is_relative_to(root) for root in allowed_roots):
