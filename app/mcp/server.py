@@ -42,6 +42,7 @@ JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
 JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
 JIRA_AUTH = (JIRA_EMAIL, JIRA_API_TOKEN)
 JIRA_HEADERS = {"Accept": "application/json"}
+JIRA_TIMEOUT_SECONDS = 10  # a hung Jira endpoint must not block the tool call forever
 
 
 # ---------------------------------------------------------------------
@@ -191,7 +192,13 @@ async def jira_epic_lookup(epic_key: str, ctx: Context) -> dict:
         description was too thin to size on — a clarifying_question the
         client's LLM drafted.
     """
-    resp = requests.get(f"{JIRA_BASE_URL}/rest/api/3/issue/{epic_key}", auth=JIRA_AUTH, headers=JIRA_HEADERS)
+    try:
+        resp = requests.get(
+            f"{JIRA_BASE_URL}/rest/api/3/issue/{epic_key}",
+            auth=JIRA_AUTH, headers=JIRA_HEADERS, timeout=JIRA_TIMEOUT_SECONDS,
+        )
+    except requests.exceptions.Timeout:
+        return {"error": f"Jira request timed out while fetching Epic {epic_key}", "epic_key": epic_key}
     if resp.status_code == 404:
         return {"error": f"Epic {epic_key} not found", "epic_key": epic_key}
     resp.raise_for_status()
@@ -242,7 +249,10 @@ async def jira_epic_lookup(epic_key: str, ctx: Context) -> dict:
 def _get_story_points_field_id():
     # Per-site custom field ID, same lookup as the seed script — not
     # hardcoded, since it can differ across Jira sites.
-    resp = requests.get(f"{JIRA_BASE_URL}/rest/api/3/field", auth=JIRA_AUTH, headers=JIRA_HEADERS)
+    resp = requests.get(
+        f"{JIRA_BASE_URL}/rest/api/3/field",
+        auth=JIRA_AUTH, headers=JIRA_HEADERS, timeout=JIRA_TIMEOUT_SECONDS,
+    )
     resp.raise_for_status()
     for f in resp.json():
         if f["name"].lower() in ("story point estimate", "story points"):
@@ -271,63 +281,71 @@ async def jira_velocity_fetch(board_id: int, ctx: Context, num_sprints: int = 3)
     Returns:
         A dict with per-sprint completed points and the average velocity.
     """
-    points_field = _get_story_points_field_id()
-    if points_field is None:
-        # Abstain rather than invent: without the story-points field, any
-        # velocity we computed would be a fabricated 0, not a grounded
-        # answer — see CONTEXT.md's groundedness principle (never invent,
-        # abstain when data is missing).
+    try:
+        points_field = _get_story_points_field_id()
+        if points_field is None:
+            # Abstain rather than invent: without the story-points field, any
+            # velocity we computed would be a fabricated 0, not a grounded
+            # answer — see CONTEXT.md's groundedness principle (never invent,
+            # abstain when data is missing).
+            return {
+                "error": "Story points field not found on this Jira site — cannot compute velocity without it.",
+                "board_id": board_id,
+                "source": "real_jira",
+            }
+
+        sprints_resp = requests.get(
+            f"{JIRA_BASE_URL}/rest/agile/1.0/board/{board_id}/sprint?state=closed",
+            auth=JIRA_AUTH, headers=JIRA_HEADERS, timeout=JIRA_TIMEOUT_SECONDS,
+        )
+        sprints_resp.raise_for_status()
+        closed_sprints = sprints_resp.json()["values"][-num_sprints:]
+        total_sprints = len(closed_sprints)
+
+        sprint_results = []
+        for i, sprint in enumerate(closed_sprints, start=1):
+            # Progress notification — sent to the client BEFORE this sprint's
+            # API call, so a slow call still shows the client what's running.
+            await ctx.report_progress(
+                progress=i, total=total_sprints,
+                message=f"Analyzing {sprint['name']} ({i}/{total_sprints})...",
+            )
+
+            # Server-side JQL filtering — let Jira narrow to "done in this
+            # sprint" instead of pulling every issue and filtering in Python,
+            # same principle as retrieve()'s conditional `where` clause.
+            # NOTE: the classic GET /rest/api/3/search endpoint was retired
+            # by Atlassian (410 Gone) — replaced by POST /rest/api/3/search/jql,
+            # which takes fields as a list and a JSON body instead of query params.
+            jql = f"sprint = {sprint['id']} AND statusCategory = Done"
+            search_resp = requests.post(
+                f"{JIRA_BASE_URL}/rest/api/3/search/jql",
+                auth=JIRA_AUTH, headers={**JIRA_HEADERS, "Content-Type": "application/json"},
+                json={"jql": jql, "fields": [points_field]},
+                timeout=JIRA_TIMEOUT_SECONDS,
+            )
+            search_resp.raise_for_status()
+            issues = search_resp.json()["issues"]
+            completed_points = sum(issue["fields"].get(points_field) or 0 for issue in issues)
+            sprint_results.append({"sprint_name": sprint["name"], "completed_points": completed_points})
+
+            # Info log — a second, human-readable notification channel
+            # distinct from progress (percent-complete vs. a log line).
+            await ctx.info(f"{sprint['name']}: {completed_points} points completed")
+
+        avg_velocity = sum(s["completed_points"] for s in sprint_results) / len(sprint_results) if sprint_results else 0
         return {
-            "error": "Story points field not found on this Jira site — cannot compute velocity without it.",
+            "board_id": board_id,
+            "sprints_analyzed": sprint_results,
+            "average_velocity": avg_velocity,
+            "source": "real_jira",
+        }
+    except requests.exceptions.Timeout:
+        return {
+            "error": f"Jira request timed out while fetching velocity data for board {board_id}",
             "board_id": board_id,
             "source": "real_jira",
         }
-
-    sprints_resp = requests.get(
-        f"{JIRA_BASE_URL}/rest/agile/1.0/board/{board_id}/sprint?state=closed",
-        auth=JIRA_AUTH, headers=JIRA_HEADERS,
-    )
-    sprints_resp.raise_for_status()
-    closed_sprints = sprints_resp.json()["values"][-num_sprints:]
-    total_sprints = len(closed_sprints)
-
-    sprint_results = []
-    for i, sprint in enumerate(closed_sprints, start=1):
-        # Progress notification — sent to the client BEFORE this sprint's
-        # API call, so a slow call still shows the client what's running.
-        await ctx.report_progress(
-            progress=i, total=total_sprints,
-            message=f"Analyzing {sprint['name']} ({i}/{total_sprints})...",
-        )
-
-        # Server-side JQL filtering — let Jira narrow to "done in this
-        # sprint" instead of pulling every issue and filtering in Python,
-        # same principle as retrieve()'s conditional `where` clause.
-        # NOTE: the classic GET /rest/api/3/search endpoint was retired
-        # by Atlassian (410 Gone) — replaced by POST /rest/api/3/search/jql,
-        # which takes fields as a list and a JSON body instead of query params.
-        jql = f"sprint = {sprint['id']} AND statusCategory = Done"
-        search_resp = requests.post(
-            f"{JIRA_BASE_URL}/rest/api/3/search/jql",
-            auth=JIRA_AUTH, headers={**JIRA_HEADERS, "Content-Type": "application/json"},
-            json={"jql": jql, "fields": [points_field]},
-        )
-        search_resp.raise_for_status()
-        issues = search_resp.json()["issues"]
-        completed_points = sum(issue["fields"].get(points_field) or 0 for issue in issues)
-        sprint_results.append({"sprint_name": sprint["name"], "completed_points": completed_points})
-
-        # Info log — a second, human-readable notification channel
-        # distinct from progress (percent-complete vs. a log line).
-        await ctx.info(f"{sprint['name']}: {completed_points} points completed")
-
-    avg_velocity = sum(s["completed_points"] for s in sprint_results) / len(sprint_results) if sprint_results else 0
-    return {
-        "board_id": board_id,
-        "sprints_analyzed": sprint_results,
-        "average_velocity": avg_velocity,
-        "source": "real_jira",
-    }
 
 
 # ---------------------------------------------------------------------
