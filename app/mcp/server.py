@@ -272,6 +272,16 @@ async def jira_velocity_fetch(board_id: int, ctx: Context, num_sprints: int = 3)
         A dict with per-sprint completed points and the average velocity.
     """
     points_field = _get_story_points_field_id()
+    if points_field is None:
+        # Abstain rather than invent: without the story-points field, any
+        # velocity we computed would be a fabricated 0, not a grounded
+        # answer — see CONTEXT.md's groundedness principle (never invent,
+        # abstain when data is missing).
+        return {
+            "error": "Story points field not found on this Jira site — cannot compute velocity without it.",
+            "board_id": board_id,
+            "source": "real_jira",
+        }
 
     sprints_resp = requests.get(
         f"{JIRA_BASE_URL}/rest/agile/1.0/board/{board_id}/sprint?state=closed",
