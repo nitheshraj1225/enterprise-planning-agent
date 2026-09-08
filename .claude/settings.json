@@ -1,5 +1,27 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'BLOCKED: .env holds the real Jira Cloud API credential for this project. Claude Code must not edit it directly — update it manually if a change is needed.' >&2; exit 2",
+            "if": "Edit(.env)"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'BLOCKED: .env holds the real Jira Cloud API credential for this project. Claude Code must not write to it directly — update it manually if a change is needed.' >&2; exit 2",
+            "if": "Write(.env)"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit",
