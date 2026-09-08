@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "venv/bin/python -m pytest tests/ -v",
+            "if": "Edit(app/mcp/server.py)"
+          }
+        ]
+      }
+    ]
+  }
+}
