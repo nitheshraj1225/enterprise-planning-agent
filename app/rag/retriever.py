@@ -9,6 +9,7 @@ LLM-based reranking pass (rerank) over the top hybrid candidates.
 
 import os
 import chromadb
+import re
 from rank_bm25 import BM25Okapi
 
 from app.agent.client import get_client, USE_REAL_API, TEST_MODEL, TEST_MAX_TOKENS
@@ -16,6 +17,13 @@ from app.agent.client import get_client, USE_REAL_API, TEST_MODEL, TEST_MAX_TOKE
 CORPUS_DIR = "app/data/synthetic_corpus"
 CATEGORIES = ["epics", "erp_records", "velocity_reports", "finance_policies", "sizing_policies"]
 
+def _tokenize(text: str) -> list:
+    # Keeps alphanumeric tokens with internal hyphens intact (so "PRJ-0001"
+    # stays one token) while stripping surrounding punctuation like the "?"
+    # in "PRJ-0001?" — plain .split() left that punctuation glued on,
+    # so an ID-bearing query could never exactly match the same ID sitting
+    # cleanly in a corpus chunk.
+    return re.findall(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", text.lower())
 
 def build_index():
     client = chromadb.PersistentClient(path="app/rag/chroma_db")
@@ -60,10 +68,10 @@ def bm25_search(query_text: str, n_results: int = 3):
     collection = client.get_or_create_collection(name="enterprise_corpus")
 
     all_chunks = collection.get()
-    tokenized_corpus = [doc.split() for doc in all_chunks["documents"]]
+    tokenized_corpus = [_tokenize(doc) for doc in all_chunks["documents"]]
     bm25 = BM25Okapi(tokenized_corpus)
 
-    tokenized_query = query_text.split()
+    tokenized_query = _tokenize(query_text)
     scores = bm25.get_scores(tokenized_query)
 
     ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:n_results]
