@@ -28,6 +28,8 @@ import json
 from app.agent.client import get_client, USE_REAL_API, TEST_MODEL, TEST_MAX_TOKENS
 
 # The exact JSON shape we're asking Claude to return (approach #1).
+ESTIMATE_MAX_TOKENS = 200
+
 EPIC_SIZING_INSTRUCTIONS = """
 You are an enterprise planning assistant. Given a short description of an
 Epic, respond with ONLY a valid JSON object — no other text before or
@@ -109,7 +111,7 @@ def get_structured_epic_estimate_tool_forced(epic_description: str, use_real: bo
     client = get_client()
     response = client.messages.create(
         model=TEST_MODEL,
-        max_tokens=TEST_MAX_TOKENS,
+        max_tokens=ESTIMATE_MAX_TOKENS,
         tools=[EPIC_SIZING_TOOL],
         tool_choice={"type": "tool", "name": "record_epic_estimate"},
         messages=[{"role": "user", "content": epic_description}],
